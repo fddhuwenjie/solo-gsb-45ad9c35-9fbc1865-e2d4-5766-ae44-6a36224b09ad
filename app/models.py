@@ -612,3 +612,57 @@ class ColorMixResponse(BaseModel):
     clipped: list[bool]  # 各 sRGB 通道在转回后是否被裁剪
     rgba: dict  # 最终 rgba：整数 r/g/b（0..255）、alpha（0..1）与 css 字符串
     trace: list[str]  # 中文逐步轨迹
+
+
+# ---------- POST /gamut-map ----------
+
+
+class GamutMapRequest(BaseModel):
+    """OKLCH -> sRGB 色域映射请求。
+
+    color 为 CSS oklch()：L 取 0..1 数值或百分比（100% = 1），
+    C 取数值或百分比（100% = 0.4），H 为角度（deg/rad/grad/turn，
+    裸数字按 deg）或 none，可带斜杠 alpha（0..1 或百分比）。
+    tolerance 为二分查找的终止区间宽度，缺省 1e-5，
+    必须在 [1e-7, 1e-3] 内。
+    """
+
+    color: str
+    tolerance: float = 1e-5
+
+
+class OklchOut(BaseModel):
+    """一个 OKLCH 颜色节点；C 为 0 或 hue 缺失（none）时 h 为 null。"""
+
+    l: float
+    c: float
+    h: Optional[float]
+    alpha: float
+
+
+class GamutMapRoundOut(BaseModel):
+    """二分查找的一轮。
+
+    lo / hi 为进入本轮时的下界 / 上界，mid 为试取的中点，
+    in_gamut 标记该中点是否仍在 sRGB 色域内（在则 lo 升为 mid，
+    否则 hi 降为 mid）。
+    """
+
+    lo: float
+    hi: float
+    mid: float
+    in_gamut: bool
+
+
+class GamutMapResponse(BaseModel):
+    input: str  # 原始输入串（去首尾空白后）
+    tolerance: float
+    original: OklchOut  # 原始 OKLCH
+    mapped: OklchOut  # 映射后的 OKLCH（L、h、alpha 与原色一致）
+    was_mapped: bool  # 是否发生了映射（原色已在 sRGB 色域内时为 false）
+    chroma_loss: float  # 色度损失：原 C - 映射后 C
+    srgb_unclamped: list[float]  # 原色直接转出的 sRGB（未裁剪，可越界）
+    srgb: list[float]  # 最终 sRGB（映射后，色域内）
+    rgba: dict  # 最终 rgba：整数 r/g/b（0..255）、alpha（0..1）与 css 字符串
+    rounds: list[GamutMapRoundOut]  # 二分查找的每轮上下界（未映射时为空）
+    trace: list[str]  # 中文逐步轨迹

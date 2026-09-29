@@ -18,6 +18,7 @@ docker compose up --build
 - `POST /math-evaluate` — CSS 数学表达式求值（calc/min/max/clamp 与四则运算）
 - `POST /grid-tracks` — 单行 CSS Grid 列宽求解（px/%/fr/minmax 轨道与项目 min_content）
 - `POST /color-mix` — 按 CSS Color 规则混合两种颜色（srgb/srgb-linear/hsl/oklab/oklch 与 hue 弧线）
+- `POST /gamut-map` — 把 CSS oklch() 颜色安全映射进 sRGB 色域（固定 L/h/alpha，二分最大色域内 C）
 - `GET /health` — 健康检查
 - `GET /docs` — Swagger UI 交互文档
 
@@ -855,6 +856,86 @@ curl -X POST http://localhost:8000/color-mix \
 - 权重为负、非有限值，补齐后权重为负（给定一侧超过 100%），或权重和为 0；
 - 在矩形空间（`srgb` / `srgb-linear` / `oklab`）指定 `hue_interpolation`。
 
+## POST /gamut-map：OKLCH -> sRGB 色域映射
+
+设计系统常以 OKLCH 描述颜色，但 sRGB 屏幕装不下高色度颜色；把越界通道
+**逐通道硬裁剪**会改变通道间比例、造成色相偏移。本端点把 CSS `oklch()`
+颜色安全落到 sRGB：**原色已在色域内时原样返回**；否则**固定 L、h 与
+alpha**，在 `[0, 原 C]` 上**二分查找仍处于色域内的最大 C**，区间宽度
+不大于 `tolerance` 时结束。
+
+请求字段：
+
+- `color`（必填）：CSS `oklch()`，L 取 0..1 数值或百分比（`100% = 1`），
+  C 取数值或百分比（`100% = 0.4`），H 为角度（`deg`/`rad`/`grad`/`turn`，
+  裸数字按 `deg`）或 `none`，可带斜杠 alpha（0..1 或百分比）；
+- `tolerance`（可选，缺省 `1e-5`）：二分终止的区间宽度，必须在
+  `[1e-7, 1e-3]` 内。
+
+8000 端口示例（请求体见 `examples/gamut-map.json`）：
+
+```bash
+curl -X POST http://localhost:8000/gamut-map \
+  -H 'Content-Type: application/json' \
+  -d @examples/gamut-map.json
+```
+
+```json
+{
+  "color": "oklch(70% 0.3 30 / 0.8)",
+  "tolerance": 0.00001
+}
+```
+
+`oklch(0.7 0.3 30)` 的未裁剪 sRGB 为 `[1.173, -0.223, -0.194]`（r 超上限、
+g/b 为负），需要映射；固定 L=0.7、h=30°、alpha=0.8 二分 15 轮后把 C 降到
+约 0.19151。响应（`rounds` 仅列前两轮）：
+
+```json
+{
+  "input": "oklch(70% 0.3 30 / 0.8)",
+  "tolerance": 1e-05,
+  "original": {"l": 0.7, "c": 0.3, "h": 30.0, "alpha": 0.8},
+  "mapped": {"l": 0.7, "c": 0.19151001, "h": 30.0, "alpha": 0.8},
+  "was_mapped": true,
+  "chroma_loss": 0.10848999,
+  "srgb_unclamped": [1.172537822, -0.223225101, -0.193761277],
+  "srgb": [0.999996159, 0.396246666, 0.318219268],
+  "rgba": {"r": 255, "g": 101, "b": 81, "alpha": 0.8,
+           "css": "rgba(255, 101, 81, 0.8)"},
+  "rounds": [
+    {"lo": 0.0, "hi": 0.3, "mid": 0.15, "in_gamut": true},
+    {"lo": 0.15, "hi": 0.3, "mid": 0.225, "in_gamut": false}
+  ],
+  "trace": ["...解析、色域判定、二分与最终结果的中文逐步轨迹..."]
+}
+```
+
+响应字段：
+
+- `original` / `mapped`：原始与映射后的 OKLCH（`C=0` 或 hue 写 `none`
+  时 `h` 为 `null`）；映射只降低 C，`l` / `h` / `alpha` 保持不变；
+- `was_mapped`：是否发生了映射（原色已在色域内时为 `false`，此时
+  `mapped` 与 `original` 相同、`chroma_loss` 为 0、`rounds` 为空）；
+- `chroma_loss`：色度损失，即 `原 C - 映射后 C`；
+- `srgb_unclamped`：原色直接转出的 sRGB（未裁剪，可越界）；
+- `srgb` / `rgba`：最终 sRGB（色域内）与其 8 位 `rgba()` 形式；
+- `rounds`：二分每轮的上下界——`lo` / `hi` 为进入本轮时的区间，
+  `mid` 为试取中点，`in_gamut` 标记中点是否仍在色域内
+  （在则 `lo` 升为 `mid`，否则 `hi` 降为 `mid`）。
+
+### 校验（HTTP 422）
+
+以下情况返回 422 并在 `detail` 中说明原因：
+
+- 非法语法：非 `oklch()` 函数、通道数不为 3、使用逗号分隔、多个斜杠、
+  hue 非角度（L / C / alpha 不接受 `none`）；
+- 非有限值：任一通道或 `tolerance` 为 `NaN` / `Infinity`
+  （如 `1e999` 解析出的无穷）；
+- L 或 alpha 越出 `[0, 1]`（越界不裁剪，直接报错）；
+- C 为负；
+- `tolerance` 不在 `[1e-7, 1e-3]` 内。
+
 ## /compute 请求模型
 
 | 字段 | 说明 |
@@ -906,7 +987,7 @@ app/
   main.py       FastAPI 入口（POST /compute、POST /selector-overlap、
                 POST /keyframe-sample、POST /counter-render、
                 POST /math-evaluate、POST /grid-tracks、POST /color-mix、
-                GET /health）
+                POST /gamut-map、GET /health）
   models.py     请求 / 响应模型
   selector.py   选择器解析与匹配、特异性计算
   overlap.py    选择器可命中性对齐搜索与冲突诊断
@@ -919,6 +1000,8 @@ app/
                 （触顶份额回流）与 fr 剩余空间迭代分配（低份额轨道先固定）
   color_mix.py  两色混合：hex/rgb/hsl 解析、sRGB/线性 sRGB/HSL/OKLab/OKLCH
                 转换、预乘 alpha 插值、hue 弧线与逐通道裁剪
+  gamut_map.py  OKLCH -> sRGB 色域映射：oklch() 解析、色域判定与
+                固定 L/h/alpha 的最大色域内 C 二分查找
   cascade.py    层叠排序键与淘汰证据生成
   variables.py  var() 解析替换、自定义属性继承与循环检测
   engine.py     计算编排
@@ -929,12 +1012,14 @@ tests/test_counters.py    /counter-render 端到端测试
 tests/test_math_eval.py   /math-evaluate 端到端测试
 tests/test_grid_tracks.py /grid-tracks 端到端测试
 tests/test_color_mix.py   /color-mix 端到端测试
+tests/test_gamut_map.py   /gamut-map 端到端测试
 examples/request.json          /compute 示例请求
 examples/keyframe-sample.json  /keyframe-sample 示例请求
 examples/counter-render.json   /counter-render 示例请求
 examples/math-evaluate.json    /math-evaluate 示例请求
 examples/grid-tracks.json      /grid-tracks 示例请求
 examples/color-mix.json        /color-mix 示例请求
+examples/gamut-map.json        /gamut-map 示例请求
 Dockerfile / docker-compose.yml
 ```
 
