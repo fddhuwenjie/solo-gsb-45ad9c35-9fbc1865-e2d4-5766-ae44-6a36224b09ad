@@ -6,6 +6,7 @@ from fastapi import FastAPI, HTTPException
 from .engine import compute
 from .color_mix import ColorMixError, mix_colors
 from .counters import CounterRenderError, render_counter_tree
+from .gamut_map import GamutMapError, gamut_map
 from .grid_tracks import GridTracksError, solve_grid_tracks
 from .keyframe import KeyframeValidationError, sample_keyframes
 from .math_eval import MathEvaluationError, evaluate_math
@@ -16,6 +17,8 @@ from .models import (
     ComputeResponse,
     CounterRenderRequest,
     CounterRenderResponse,
+    GamutMapRequest,
+    GamutMapResponse,
     GridTracksRequest,
     GridTracksResponse,
     KeyframeSampleRequest,
@@ -34,7 +37,7 @@ app = FastAPI(
     description="CSS 层叠解释 API：按来源 / 层 / important / 特异性 / 源码次序计算声明胜出者，"
     "解析自定义属性与 var()，并给出逐步淘汰证据；另含选择器可命中性判断、"
     " CSS 数值属性关键帧采样、CSS 计数器元素树渲染、CSS 数学表达式求值、"
-    "单行 CSS Grid 列宽求解与 color-mix() 风格两色混合。",
+    "单行 CSS Grid 列宽求解、color-mix() 风格两色混合与 OKLCH -> sRGB 色域映射。",
 )
 
 
@@ -112,4 +115,16 @@ def color_mix_endpoint(req: ColorMixRequest) -> ColorMixResponse:
     try:
         return mix_colors(req)
     except ColorMixError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/gamut-map", response_model=GamutMapResponse)
+def gamut_map_endpoint(req: GamutMapRequest) -> GamutMapResponse:
+    """把 CSS oklch() 颜色安全落到 sRGB 色域：原色已在色域内则原样返回；
+    否则固定 L、h 与 alpha，在 [0, 原 C] 上二分搜索仍处于色域内的最大 C，
+    区间宽度不大于 tolerance 后结束，返回原始 / 映射后 OKLCH、未裁剪 /
+    最终 sRGB、色度损失与每轮上下界。"""
+    try:
+        return gamut_map(req)
+    except GamutMapError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc

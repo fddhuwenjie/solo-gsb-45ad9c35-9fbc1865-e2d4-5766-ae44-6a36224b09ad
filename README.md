@@ -18,6 +18,7 @@ docker compose up --build
 - `POST /math-evaluate` — CSS 数学表达式求值（calc/min/max/clamp 与四则运算）
 - `POST /grid-tracks` — 单行 CSS Grid 列宽求解（px/%/fr/minmax 轨道与项目 min_content）
 - `POST /color-mix` — 按 CSS Color 规则混合两种颜色（srgb/srgb-linear/hsl/oklab/oklch 与 hue 弧线）
+- `POST /gamut-map` — 把 OKLCH 颜色安全映射到 sRGB 色域（固定 L/h，二分降色度）
 - `GET /health` — 健康检查
 - `GET /docs` — Swagger UI 交互文档
 
@@ -855,6 +856,103 @@ curl -X POST http://localhost:8000/color-mix \
 - 权重为负、非有限值，补齐后权重为负（给定一侧超过 100%），或权重和为 0；
 - 在矩形空间（`srgb` / `srgb-linear` / `oklab`）指定 `hue_interpolation`。
 
+## POST /gamut-map：OKLCH -> sRGB 色域映射
+
+高彩度的 OKLCH 颜色直接转到 sRGB 时通道可能超出 `[0,1]`，**逐通道硬裁剪**会
+同时改变明度与色相。本端点按 CSS Color 4 的色域映射思路安全落色：若原色已在
+sRGB 色域内则**原样返回**；否则**固定 L、h 与 alpha**，只在 `[0, 原 C]` 上
+**二分搜索**仍处于色域内的最大色度 C\*，把颜色沿灰轴方向收进色域，色相不偏移。
+
+8000 端口示例（请求体见 `examples/gamut-map.json`）：
+
+```bash
+curl -X POST http://localhost:8000/gamut-map \
+  -H 'Content-Type: application/json' \
+  -d @examples/gamut-map.json
+```
+
+请求体：
+
+```json
+{
+  "color": "oklch(0.705 0.28 145)",
+  "tolerance": 0.0001
+}
+```
+
+`color` 为 CSS Color 4 现代空格语法的 `oklch(L C H [/ A])`：
+
+- `L`：裸数字 `0..1` 或百分比 `0%..100%`；
+- `C`：非负裸数字，或百分比（按 CSS 规定以 `0.4` 为满量程，`100% === 0.4`，
+  允许超过 `100%`）；
+- `H`：角度（`deg` / `rad` / `grad` / `turn`，无单位按 deg），**C=0 时 hue
+  可写 `none`**（也可在 C>0 时写 `none`，按 0° 参与计算）；
+- 可选 `A`：`/ 0.5` 或 `/ 50%`，范围 `0..1`（`none` 视为 1）。
+
+`tolerance` 为二分终止的区间宽度，必须在 **`[1e-7, 1e-3]`** 内。
+
+`oklch(0.705 0.28 145)` 直接转 sRGB 得到 `[-1.0849, 0.7834, -0.3238]`（R、B
+为负，超色域）。固定 L=0.705、h=145° 后在 C∈[0, 0.28] 二分，色域内则抬下界、
+越界则压上界，区间宽度不大于 tolerance 时停止。响应：
+
+```json
+{
+  "original": {"css": "oklch(0.705 0.28 145)", "l": 0.705, "c": 0.28,
+               "hue": 145.0, "alpha": 1.0},
+  "mapped": {"css": "oklch(0.705 0.221689453 145)", "l": 0.705,
+             "c": 0.221689453, "hue": 145.0, "alpha": 1.0},
+  "srgb_unclamped": [-1.084877402, 0.783382421, -0.323776121],
+  "srgb": [0.000851813, 0.757135115, 0.208076728],
+  "srgb_css": "rgba(0, 193, 53, 1)",
+  "chroma_loss": {"absolute": 0.058310547, "relative": 0.208251953},
+  "gamut_mapped": true,
+  "tolerance": 0.0001,
+  "iterations": [
+    {"iteration": 1, "lower": 0.0, "upper": 0.28, "midpoint": 0.14,
+     "srgb": [0.386068938, 0.71555274, 0.403585076], "in_gamut": true},
+    {"iteration": 2, "lower": 0.14, "upper": 0.28, "midpoint": 0.21,
+     "srgb": [0.139589474, 0.751552446, 0.244932138], "in_gamut": true},
+    {"iteration": 3, "lower": 0.21, "upper": 0.28, "midpoint": 0.245,
+     "srgb": [-0.43815985, 0.767937497, 0.102382355], "in_gamut": false}
+  ],
+  "final_interval": {"lower": 0.221689453, "upper": 0.221757813,
+                     "width": 0.00006836},
+  "trace": ["解析 'oklch(0.705 0.28 145)'：L=0.705，C=0.28，hue=145°，alpha=1",
+            "原色转 sRGB 得 [...]，R、B 通道超出 [0,1]；固定 ... 在 C ∈ [0, 0.28] 上二分搜索",
+            "第 1 轮：区间 [0, 0.28]，中点 C=0.14 ... 在色域内，下界抬到中点",
+            "...",
+            "区间宽度 6.84e-05 不大于 tolerance=0.0001，搜索结束：C 由 0.28 降到 ..."]
+}
+```
+
+字段说明：
+
+| 字段 | 含义 |
+| --- | --- |
+| `original` / `mapped` | 原始 / 映射后 OKLCH（`css`、`l`、`c`、`hue`、`alpha`；`hue` 为 `null` 即 `none`）。原色在色域内时二者相同 |
+| `srgb_unclamped` | 原始 OKLCH 直接转换、**未裁剪**的 sRGB（可能小于 0 或大于 1） |
+| `srgb` / `srgb_css` | 映射结果裁剪到 `[0,1]` 的最终 sRGB 与其 8 位 `rgba()` |
+| `chroma_loss` | 色度损失：`absolute = C - C*`，`relative = (C - C*) / C`（C=0 时为 0） |
+| `gamut_mapped` | 是否执行了映射（原色在色域内为 `false`） |
+| `iterations[]` | 每轮的 `lower` / `upper` / `midpoint`、中点未裁剪 sRGB 与 `in_gamut` 判定 |
+| `final_interval` | 终止区间 `{lower, upper, width}`：`lower` 即采用的最终色度（保证色域内）；未映射时为 `null` |
+| `trace` | 中文逐步轨迹 |
+
+色域判定带 `1e-7` 容差吸收 sRGB -> OKLCH -> sRGB 往返浮点噪声，因此 sRGB
+原色（如纯蓝 `oklch(0.452 0.313 264)`）不会被无谓地降 C。
+
+### 校验（HTTP 422）
+
+以下情况返回 422 并在 `detail` 中说明原因：
+
+- `color` 不是合法 `oklch()`（非该函数、括号 / 分量数错误、逗号分隔、
+  多余斜杠、分量不是数值 / 百分比 / 合法角度）；
+- 任一数值为非有限值（`NaN` / `Infinity`）；
+- `L` 越界（裸数字不在 `[0,1]`、百分比不在 `[0%,100%]`）；
+- `alpha` 越界（不在 `[0,1]` / `[0%,100%]`）；
+- `C` 为负；
+- `tolerance` 不在 `[1e-7, 1e-3]` 内（含非有限值）。
+
 ## /compute 请求模型
 
 | 字段 | 说明 |
@@ -906,7 +1004,7 @@ app/
   main.py       FastAPI 入口（POST /compute、POST /selector-overlap、
                 POST /keyframe-sample、POST /counter-render、
                 POST /math-evaluate、POST /grid-tracks、POST /color-mix、
-                GET /health）
+                POST /gamut-map、GET /health）
   models.py     请求 / 响应模型
   selector.py   选择器解析与匹配、特异性计算
   overlap.py    选择器可命中性对齐搜索与冲突诊断
@@ -919,6 +1017,8 @@ app/
                 （触顶份额回流）与 fr 剩余空间迭代分配（低份额轨道先固定）
   color_mix.py  两色混合：hex/rgb/hsl 解析、sRGB/线性 sRGB/HSL/OKLab/OKLCH
                 转换、预乘 alpha 插值、hue 弧线与逐通道裁剪
+  gamut_map.py  OKLCH -> sRGB 色域映射：oklch() 解析、色域判定（1e-7 容差）
+                与固定 L/h/alpha 的色度二分搜索
   cascade.py    层叠排序键与淘汰证据生成
   variables.py  var() 解析替换、自定义属性继承与循环检测
   engine.py     计算编排
@@ -929,12 +1029,14 @@ tests/test_counters.py    /counter-render 端到端测试
 tests/test_math_eval.py   /math-evaluate 端到端测试
 tests/test_grid_tracks.py /grid-tracks 端到端测试
 tests/test_color_mix.py   /color-mix 端到端测试
+tests/test_gamut_map.py   /gamut-map 端到端测试
 examples/request.json          /compute 示例请求
 examples/keyframe-sample.json  /keyframe-sample 示例请求
 examples/counter-render.json   /counter-render 示例请求
 examples/math-evaluate.json    /math-evaluate 示例请求
 examples/grid-tracks.json      /grid-tracks 示例请求
 examples/color-mix.json        /color-mix 示例请求
+examples/gamut-map.json        /gamut-map 示例请求
 Dockerfile / docker-compose.yml
 ```
 
